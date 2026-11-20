@@ -3,10 +3,11 @@
 // connector coordination
 
 use crate::config::KvConnector;
+use omq_tokio::{Options, Socket, SocketType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -177,74 +178,60 @@ impl ServiceRegistry {
             bind_address
         );
 
+        let endpoint = format!("tcp://{bind_address}");
+        let socket = Socket::new(SocketType::Router, Options::default());
+        let bound = socket
+            .bind(endpoint.as_str())
+            .await
+            .map_err(|error| format!("Failed to bind service discovery to {endpoint}: {error}"))?;
+        info!(%bound, "ZMQ service discovery bound");
+
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
 
         let prefill_instances = Arc::clone(&self.prefill_instances);
         let decode_instances = Arc::clone(&self.decode_instances);
         let moriio_transfer_mode = Arc::clone(&self.moriio_transfer_mode);
-        let bind_addr = bind_address.to_string();
-
         tokio::spawn(async move {
-            // Initialize ZMQ context and socket
-            let context = zmq::Context::new();
-            let router_socket = context.socket(zmq::ROUTER).unwrap();
-
-            if let Err(e) = router_socket.bind(&format!("tcp://{}", bind_addr)) {
-                warn!("Failed to bind ZMQ socket to {}: {}", bind_addr, e);
-                return;
-            }
-
-            info!("ZMQ service discovery bound to tcp://{}", bind_addr);
-
-            // Set non-blocking mode for graceful shutdown
-            router_socket.set_rcvtimeo(1000).unwrap(); // 1 second timeout
-
+            let mut cleanup = tokio::time::interval(Duration::from_millis(100));
+            cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                // Check for shutdown signal
-                if shutdown_rx.try_recv().is_ok() {
-                    info!("Service discovery shutting down");
-                    break;
-                }
-
-                // Try to receive a message
-                match router_socket.recv_multipart(zmq::DONTWAIT) {
-                    Ok(message_parts) => {
-                        if message_parts.len() >= 2 {
-                            let remote_address = message_parts[0].clone();
-                            let message_data = &message_parts[1];
-
-                            Self::handle_registration_message(
-                                message_data,
-                                &remote_address,
-                                &prefill_instances,
-                                &decode_instances,
-                                kv_connector,
-                                &moriio_transfer_mode,
-                            )
-                            .await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => break,
+                    _ = cleanup.tick() => {
+                        Self::cleanup_expired_instances(&prefill_instances, &decode_instances);
+                    }
+                    received = socket.recv() => {
+                        match received {
+                            Ok(message) if message.len() >= 2 => {
+                                Self::handle_registration_message(
+                                    &message[1],
+                                    &message[0],
+                                    &prefill_instances,
+                                    &decode_instances,
+                                    kv_connector,
+                                    &moriio_transfer_mode,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, "ZMQ service discovery receive failed");
+                                break;
+                            }
                         }
-                    }
-                    Err(zmq::Error::EAGAIN) => {
-                        // No message available, continue
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                    Err(e) => {
-                        warn!("ZMQ receive error: {}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        tokio::task::consume_budget().await;
                     }
                 }
-
-                // Clean up expired instances periodically
-                Self::cleanup_expired_instances(&prefill_instances, &decode_instances).await;
             }
+            info!("Service discovery shutting down");
         });
 
         Ok(())
     }
 
     /// Handle incoming service registration message
-    async fn handle_registration_message(
+    fn handle_registration_message(
         message_data: &[u8],
         remote_address: &[u8],
         prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
@@ -333,7 +320,7 @@ impl ServiceRegistry {
     }
 
     /// Clean up expired service instances
-    async fn cleanup_expired_instances(
+    fn cleanup_expired_instances(
         prefill_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
         decode_instances: &Arc<Mutex<HashMap<String, ServiceInstance>>>,
     ) {
@@ -555,6 +542,41 @@ impl Drop for ServiceRegistry {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn listener_accepts_libzmq_dealer_registration() {
+        let port = portpicker::pick_unused_port().unwrap();
+        let address = format!("127.0.0.1:{port}");
+        let mut registry = ServiceRegistry::new();
+        registry
+            .start_listener(&address, KvConnector::MoriIO)
+            .await
+            .unwrap();
+
+        let context = zmq::Context::new();
+        let dealer = context.socket(zmq::DEALER).unwrap();
+        dealer.set_linger(0).unwrap();
+        dealer.connect(&format!("tcp://{address}")).unwrap();
+        dealer.send(make_moriio_msgpack("P", "READ"), 0).unwrap();
+
+        let registration = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(address) =
+                    registry.get_zmq_address("1.2.3.4:8000", ServiceType::Prefill)
+                {
+                    break address;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("libzmq DEALER registration");
+        assert_eq!(registration, "host:1.2.3.4,handshake:6301,notify:61005");
+        assert_eq!(
+            registry.moriio_transfer_mode.get(),
+            Some(&MoriIOTransferMode::Read)
+        );
+    }
 
     fn make_moriio_msgpack(service_type: &str, transfer_mode: &str) -> Vec<u8> {
         // rmp_serde::to_vec_named produces msgpack — suitable for our deserializer.

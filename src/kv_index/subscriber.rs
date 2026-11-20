@@ -5,6 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use omq_tokio::{Message, Options, Payload, Socket, SocketType};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -39,7 +40,7 @@ pub struct EventSource {
     pub pub_endpoint: String,
     pub replay_endpoint: Option<String>,
     pub topic: String,
-    /// SUB receive high-water mark; None leaves the ZMQ default.
+    /// SUB receive high-water mark. None uses the socket default.
     pub hwm: Option<i32>,
     /// Opt-in authoritative-history recovery; otherwise retain fresh-observation credit.
     pub strict_recovery: bool,
@@ -63,13 +64,11 @@ pub fn spawn(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
-    ctx: Arc<zmq::Context>,
 ) -> SubscriberHandle {
     spawn_inner(
         source,
         indexer,
         signal_tx,
-        ctx,
         None,
         None,
         ReplayLimits::default(),
@@ -90,7 +89,6 @@ pub(super) fn spawn_bound(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
-    ctx: Arc<zmq::Context>,
     expected_block_size: Option<u32>,
     lease: SourceLease,
 ) -> SubscriberHandle {
@@ -98,7 +96,6 @@ pub(super) fn spawn_bound(
         source,
         indexer,
         signal_tx,
-        ctx,
         expected_block_size,
         Some(SubscriberBinding {
             lease,
@@ -159,7 +156,6 @@ fn spawn_inner(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
-    ctx: Arc<zmq::Context>,
     expected_block_size: Option<u32>,
     binding: Option<SubscriberBinding>,
     limits: ReplayLimits,
@@ -175,22 +171,21 @@ fn spawn_inner(
     let strict_recovery = source.strict_recovery;
 
     tokio::spawn(async move {
-        let mut sub = match ctx.socket(zmq::SUB) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("kv_index sub socket for {}: {}", source_id, e);
-                return;
-            }
-        };
-        if let Some(h) = hwm {
-            sub.set_rcvhwm(h).ok();
+        let mut options = Options::default();
+        if let Some(hwm) = hwm.and_then(|value| u32::try_from(value).ok()) {
+            // ZMQ uses zero for unlimited. Use OMQ's maximum bounded queue.
+            options = options.recv_hwm(if hwm == 0 { u32::MAX } else { hwm });
         }
-        if let Err(e) = sub.connect(&pub_endpoint) {
-            warn!("kv_index connect {} to {}: {}", source_id, pub_endpoint, e);
+        let sub = Socket::new(SocketType::Sub, options);
+        if let Err(error) = sub
+            .subscribe(bytes::Bytes::copy_from_slice(topic.as_bytes()))
+            .await
+        {
+            warn!(%source_id, %error, "kv_index subscribe failed");
             return;
         }
-        if let Err(error) = sub.set_subscribe(topic.as_bytes()) {
-            warn!(%source_id, %error, "kv_index subscribe failed");
+        if let Err(error) = sub.connect(pub_endpoint.as_str()).await {
+            warn!(%source_id, %pub_endpoint, %error, "kv_index subscriber connect failed");
             return;
         }
         if with_binding(binding.as_ref(), |_| {
@@ -200,8 +195,6 @@ fn spawn_inner(
         {
             return;
         }
-        // zmq recv is sync; DONTWAIT + sleep keeps the tokio worker free. No
-        // rcvtimeo — it's a no-op under DONTWAIT.
         info!(
             "kv_index subscriber for {} rank{} on {}",
             source_id, dp_rank, pub_endpoint
@@ -212,27 +205,32 @@ fn spawn_inner(
         let mut full_attention_rejection_reported = false;
         let mut retries = ReplayRetryBudget::new(limits.retry_base);
         let mut pending_live = VecDeque::new();
+        let retired = wait_for_retirement(binding.as_ref());
+        tokio::pin!(retired);
 
         loop {
-            if is_shutdown(&mut shutdown_rx)
-                || binding
-                    .as_ref()
-                    .is_some_and(|binding| !binding.lease.is_active())
-            {
-                info!("kv_index subscriber {} shutting down", source_id);
-                break;
-            }
-            let received = pending_live
-                .pop_front()
-                .map_or_else(|| sub.recv_multipart(zmq::DONTWAIT), Ok);
+            let received = if let Some(message) = pending_live.pop_front() {
+                if is_shutdown(&mut shutdown_rx)
+                    || binding
+                        .as_ref()
+                        .is_some_and(|binding| !binding.lease.is_active())
+                {
+                    break;
+                }
+                Ok(message)
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => break,
+                    _ = &mut retired => break,
+                    result = sub.recv() => result,
+                }
+            };
+            tokio::task::consume_budget().await;
             match received {
                 Ok(frames) => {
                     // ZMQ SUB matches topic prefixes, not complete topics.
-                    if frames
-                        .first()
-                        .is_some_and(|frame| frame.as_slice() != topic.as_bytes())
-                    {
-                        tokio::task::yield_now().await;
+                    if frames.get(0).is_some_and(|frame| frame != topic.as_bytes()) {
                         continue;
                     }
                     if frames.len() != 3 || frames[1].len() != 8 {
@@ -335,7 +333,6 @@ fn spawn_inner(
                                 replay_start,
                                 seq,
                                 attempt,
-                                &ctx,
                                 &indexer,
                                 &source_id,
                                 dp_rank,
@@ -349,7 +346,7 @@ fn spawn_inner(
                             );
                             buffer_live_during_replay(
                                 recovery,
-                                &mut sub,
+                                &sub,
                                 &topic,
                                 &mut pending_live,
                                 MAX_PENDING_LIVE_BYTES,
@@ -523,19 +520,14 @@ fn spawn_inner(
                         );
                         debug!(source = %source_id, rank = dp_rank, seq, "kv_index live sequence advanced");
                     }
-                    // A sustained publisher starves EAGAIN; yield so this task
-                    // can't monopolize the runtime worker.
-                    tokio::task::yield_now().await;
                 }
-                Err(zmq::Error::EAGAIN) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(e) => {
-                    warn!("kv_index sub {} recv: {}", source_id, e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(error) => {
+                    warn!(%source_id, %error, "kv_index subscriber receive failed");
+                    break;
                 }
             }
         }
+        info!("kv_index subscriber {} shutting down", source_id);
     });
 
     SubscriberHandle { shutdown_tx }
@@ -555,57 +547,55 @@ enum ReplayOutcome {
     Stopped,
 }
 
+async fn wait_for_retirement(binding: Option<&SubscriberBinding>) {
+    match binding {
+        Some(binding) => binding.lease.retired.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn buffer_live_during_replay(
     recovery: impl Future<Output = Option<i64>>,
-    sub: &mut zmq::Socket,
+    sub: &Socket,
     topic: &str,
-    pending: &mut VecDeque<Vec<Vec<u8>>>,
+    pending: &mut VecDeque<Message>,
     byte_limit: usize,
     shutdown: &mut broadcast::Receiver<()>,
     binding: Option<&SubscriberBinding>,
 ) -> ReplayOutcome {
     tokio::pin!(recovery);
-    let mut bytes: usize = pending.iter().flatten().map(Vec::len).sum();
+    let retired = wait_for_retirement(binding);
+    tokio::pin!(retired);
+    let mut bytes: usize = pending.iter().map(Message::byte_len).sum();
     loop {
-        if binding.is_some_and(|binding| !binding.lease.is_active()) {
-            return ReplayOutcome::Stopped;
+        if pending.len() >= MAX_PENDING_LIVE_FRAMES || bytes >= byte_limit {
+            warn!("kv_index live recovery buffer full; aborting replay");
+            return ReplayOutcome::BufferFull;
         }
         tokio::select! {
             biased;
             _ = shutdown.recv() => return ReplayOutcome::Stopped,
+            _ = &mut retired => return ReplayOutcome::Stopped,
             result = &mut recovery => return match result {
                 Some(high) => ReplayOutcome::Complete(high),
                 None => ReplayOutcome::Failed,
             },
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                // Bound work per poll so replay can progress under a busy publisher.
-                for _ in 0..64 {
-                    if pending.len() >= MAX_PENDING_LIVE_FRAMES || bytes >= byte_limit {
-                        warn!("kv_index live recovery buffer full; aborting replay before resuming ingestion");
-                        return ReplayOutcome::BufferFull;
+            result = sub.recv() => {
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(%error, "kv_index live receive failed during replay");
+                        return ReplayOutcome::Failed;
                     }
-                    match sub.recv_multipart(zmq::DONTWAIT) {
-                        Ok(frames) => {
-                            if frames.first().is_some_and(|frame| frame.as_slice() != topic.as_bytes()) {
-                                continue;
-                            }
-                            bytes = bytes.saturating_add(frames.iter().map(Vec::len).sum::<usize>());
-                            // Keep even the frame crossing the budget: it has already
-                            // left ZMQ and must not be silently lost. Memory can exceed
-                            // the queue budget by this one transport frame.
-                            pending.push_back(frames);
-                            if bytes >= byte_limit {
-                                warn!("kv_index live recovery byte budget reached; aborting replay");
-                                return ReplayOutcome::BufferFull;
-                            }
-                        }
-                        Err(zmq::Error::EAGAIN) => break,
-                        Err(error) => {
-                            warn!(%error, "kv_index live receive failed during replay");
-                            return ReplayOutcome::Failed;
-                        }
-                    }
+                };
+                if message.get(0).is_some_and(|frame| frame != topic.as_bytes()) {
+                    tokio::task::consume_budget().await;
+                    continue;
                 }
+                bytes = bytes.saturating_add(message.byte_len());
+                // Keep the message that crosses the budget for live ingestion.
+                pending.push_back(message);
+                tokio::task::consume_budget().await;
             }
         }
     }
@@ -841,7 +831,6 @@ async fn replay(
     last_seq: i64,
     through_seq: i64,
     attempt: u64,
-    ctx: &zmq::Context,
     indexer: &Arc<KvBlockIndexer>,
     source_id: &SourceId,
     dp_rank: u32,
@@ -853,41 +842,33 @@ async fn replay(
     binding: Option<&SubscriberBinding>,
     timeout: Duration,
 ) -> Option<i64> {
-    let dealer = match ctx.socket(zmq::DEALER) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("kv_index replay socket for {}: {}", source_id, e);
-            return None;
-        }
-    };
-    if let Err(e) = dealer.connect(endpoint) {
-        warn!("kv_index replay connect {}: {}", endpoint, e);
+    let dealer = Socket::new(SocketType::Dealer, Options::default());
+    if let Err(error) = dealer.connect(endpoint).await {
+        warn!(%source_id, %endpoint, %error, "kv_index replay connect failed");
         return None;
     }
-    // Request everything strictly past the live high-water.
-    let start_bytes = ((last_seq + 1) as u64).to_be_bytes();
-    // DEALER sends [empty delim, start_seq].
-    if dealer
-        .send_multipart([vec![], start_bytes.to_vec()], zmq::DONTWAIT)
-        .is_err()
-    {
-        warn!("kv_index replay {} send failed", source_id);
-        return None;
-    }
-    // ponytail: bounded poll loop. Replay is brief and rare; a hard deadline
-    // guards against a silent router. Swap for backoff if replay grows large.
     let deadline = tokio::time::Instant::now() + timeout;
+    let start_bytes = ((last_seq + 1) as u64).to_be_bytes();
+    let request = Message::multipart_payloads([Payload::new(), Payload::from_slice(&start_bytes)]);
+    if !matches!(
+        tokio::time::timeout_at(deadline, dealer.send(request)).await,
+        Ok(Ok(()))
+    ) {
+        warn!(%source_id, "kv_index replay request failed");
+        return None;
+    }
     let mut high = last_seq;
     loop {
         if binding.is_some_and(|binding| !binding.lease.is_active()) {
             return None;
         }
         if tokio::time::Instant::now() >= deadline {
-            warn!("kv_index replay {} timed out", source_id);
-            break;
+            warn!(%source_id, "kv_index replay timed out");
+            return None;
         }
-        match dealer.recv_multipart(zmq::DONTWAIT) {
-            Ok(frames) => {
+        match tokio::time::timeout_at(deadline, dealer.recv()).await {
+            Ok(Ok(frames)) => {
+                tokio::task::consume_budget().await;
                 // DEALER reply: [empty, topic, seq, payload]; seq is 2nd-from-last.
                 if frames.len() != 4 || !frames[0].is_empty() || frames[2].len() != 8 {
                     break;
@@ -900,7 +881,7 @@ async fn replay(
                     }
                     break;
                 }
-                if frames[1].as_slice() != topic.as_bytes() || seq < 0 {
+                if &frames[1] != topic.as_bytes() || seq < 0 {
                     return None;
                 }
                 if seq <= high {
@@ -960,13 +941,13 @@ async fn replay(
                 if high >= through_seq {
                     return Some(high);
                 }
-                tokio::task::yield_now().await;
             }
-            Err(zmq::Error::EAGAIN) => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok(Err(error)) => {
+                warn!(%source_id, %error, "kv_index replay receive failed");
+                break;
             }
-            Err(e) => {
-                warn!("kv_index replay {} recv: {}", source_id, e);
+            Err(_) => {
+                warn!(%source_id, "kv_index replay timed out");
                 break;
             }
         }
@@ -986,9 +967,8 @@ fn hex(b: &[u8]) -> String {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use parking_lot::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::kv_index::admit::FullAttentionRejectionReason;
@@ -1310,7 +1290,6 @@ mod tests {
             },
             indexer.clone(),
             Some(sig_tx),
-            ctx.clone(),
         );
 
         let local: Arc<str> = Arc::from(hex(&local_hashes(&[1, 2, 3, 4], 4, None)[0]));
@@ -1393,14 +1372,15 @@ mod tests {
     async fn compatibility_subscriber_preserves_nonzero_rank_and_nondevice_tiers() {
         let ctx = Arc::new(zmq::Context::new());
         let publisher = ctx.socket(zmq::PUB).unwrap();
-        publisher.bind("inproc://generic-rank-tier").unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
         let indexer = Arc::new(KvBlockIndexer::new());
         let (tx, mut signals) = mpsc::channel(64);
         let handle = spawn(
             EventSource {
                 source: SourceId::from("generic-worker"),
                 dp_rank: 3,
-                pub_endpoint: "inproc://generic-rank-tier".into(),
+                pub_endpoint: endpoint,
                 replay_endpoint: None,
                 topic: "kv/generic".into(),
                 hwm: Some(64),
@@ -1408,7 +1388,6 @@ mod tests {
             },
             indexer.clone(),
             Some(tx),
-            ctx,
         );
         let host_tokens = [1, 2, 3, 4];
         let external_tokens = [5, 6, 7, 8];
@@ -1501,23 +1480,26 @@ mod tests {
         _handle: SubscriberHandle,
     }
 
-    fn fixture(with_replay: bool) -> Fixture {
-        fixture_with_block_size(with_replay, None)
+    async fn fixture(with_replay: bool) -> Fixture {
+        fixture_with_block_size(with_replay, None).await
     }
 
-    fn fixture_with_block_size(with_replay: bool, expected_block_size: Option<u32>) -> Fixture {
-        fixture_with_binding(with_replay, expected_block_size, None)
+    async fn fixture_with_block_size(
+        with_replay: bool,
+        expected_block_size: Option<u32>,
+    ) -> Fixture {
+        fixture_with_binding(with_replay, expected_block_size, None).await
     }
 
-    fn fixture_with_binding(
+    async fn fixture_with_binding(
         with_replay: bool,
         expected_block_size: Option<u32>,
         binding: Option<SubscriberBinding>,
     ) -> Fixture {
-        fixture_with_recovery(with_replay, expected_block_size, binding, true)
+        fixture_with_recovery(with_replay, expected_block_size, binding, true).await
     }
 
-    fn fixture_with_recovery(
+    async fn fixture_with_recovery(
         with_replay: bool,
         expected_block_size: Option<u32>,
         binding: Option<SubscriberBinding>,
@@ -1531,9 +1513,10 @@ mod tests {
             None,
             ReplayLimits::default(),
         )
+        .await
     }
 
-    fn fixture_with_receive_limit(
+    async fn fixture_with_receive_limit(
         with_replay: bool,
         expected_block_size: Option<u32>,
         binding: Option<SubscriberBinding>,
@@ -1541,20 +1524,16 @@ mod tests {
         hwm: Option<i32>,
         limits: ReplayLimits,
     ) -> Fixture {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
         let ctx = Arc::new(zmq::Context::new());
-        let publisher = ctx.socket(zmq::PUB).unwrap();
+        let publisher = ctx.socket(zmq::XPUB).unwrap();
         if let Some(hwm) = hwm {
             publisher.set_sndhwm(hwm).unwrap();
         }
-        let pub_endpoint = format!("inproc://kv-loss-pub-{tag}");
-        publisher.bind(&pub_endpoint).unwrap();
-        let replay_endpoint = format!("inproc://kv-loss-replay-{tag}");
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let pub_endpoint = publisher.get_last_endpoint().unwrap().unwrap();
         let replay_server = with_replay.then(|| {
             let socket = ctx.socket(zmq::ROUTER).unwrap();
-            socket.bind(&replay_endpoint).unwrap();
+            socket.bind("tcp://127.0.0.1:*").unwrap();
             socket
         });
         let indexer = Arc::new(KvBlockIndexer::new());
@@ -1563,7 +1542,9 @@ mod tests {
             source: SourceId::from("w0"),
             dp_rank: 0,
             pub_endpoint,
-            replay_endpoint: with_replay.then_some(replay_endpoint),
+            replay_endpoint: replay_server
+                .as_ref()
+                .map(|s| s.get_last_endpoint().unwrap().unwrap()),
             topic: "kv".into(),
             hwm,
             strict_recovery,
@@ -1572,11 +1553,22 @@ mod tests {
             source,
             indexer.clone(),
             Some(tx),
-            ctx.clone(),
             expected_block_size,
             binding,
             limits,
         );
+        let subscription = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match publisher.recv_bytes(zmq::DONTWAIT) {
+                    Ok(bytes) => break bytes,
+                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                    Err(error) => panic!("receive subscription: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("subscriber did not send its live subscription");
+        assert_eq!(subscription, b"\x01kv");
         Fixture {
             _ctx: ctx,
             publisher,
@@ -1619,8 +1611,8 @@ mod tests {
     async fn bound_external_invalidation_requires_clear_barrier() {
         let ctx = Arc::new(zmq::Context::new());
         let publisher = ctx.socket(zmq::PUB).unwrap();
-        let endpoint = "inproc://kv-bound-active-resume";
-        publisher.bind(endpoint).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
         let indexer = Arc::new(KvBlockIndexer::new());
         let strict_rank = Arc::new(Mutex::new(true));
         let (tx, mut signals) = mpsc::channel(64);
@@ -1628,7 +1620,7 @@ mod tests {
             EventSource {
                 source: SourceId::from("w0"),
                 dp_rank: 0,
-                pub_endpoint: endpoint.into(),
+                pub_endpoint: endpoint,
                 replay_endpoint: None,
                 topic: "kv".into(),
                 hwm: None,
@@ -1636,11 +1628,10 @@ mod tests {
             },
             indexer.clone(),
             Some(tx),
-            ctx.clone(),
             Some(4),
             SourceLease {
                 strict_rank: strict_rank.clone(),
-                active: Arc::new(AtomicBool::new(true)),
+                retired: Arc::new(CancellationToken::new()),
             },
         );
         let old = [1, 2, 3, 4];
@@ -1726,12 +1717,13 @@ mod tests {
             Some(SubscriberBinding {
                 lease: SourceLease {
                     strict_rank: strict_rank.clone(),
-                    active: Arc::new(AtomicBool::new(true)),
+                    retired: Arc::new(CancellationToken::new()),
                 },
                 replay_cleanup_barrier: None,
                 replay_commit_barrier: None,
             }),
-        );
+        )
+        .await;
         let old = [1, 2, 3, 4];
         let fresh = [5, 6, 7, 8];
         let foreign = [9, 10, 11, 12];
@@ -1824,12 +1816,13 @@ mod tests {
                 Some(SubscriberBinding {
                     lease: SourceLease {
                         strict_rank: Arc::new(Mutex::new(true)),
-                        active: Arc::new(AtomicBool::new(true)),
+                        retired: Arc::new(CancellationToken::new()),
                     },
                     replay_cleanup_barrier: None,
                     replay_commit_barrier: None,
                 }),
-            );
+            )
+            .await;
             let old = [1, 2, 3, 4];
             let recovered = [5, 6, 7, 8];
             let fresh = [9, 10, 11, 12];
@@ -1897,7 +1890,7 @@ mod tests {
     #[tokio::test]
     async fn retired_replay_cannot_clear_or_mutate_a_replacement_subscription() {
         let strict_rank = Arc::new(Mutex::new(false));
-        let active = Arc::new(AtomicBool::new(true));
+        let retired = Arc::new(CancellationToken::new());
         let cleanup_barrier = Arc::new(tokio::sync::Barrier::new(2));
         let mut f = fixture_with_binding(
             true,
@@ -1905,12 +1898,13 @@ mod tests {
             Some(SubscriberBinding {
                 lease: SourceLease {
                     strict_rank: strict_rank.clone(),
-                    active: active.clone(),
+                    retired: retired.clone(),
                 },
                 replay_cleanup_barrier: Some(cleanup_barrier.clone()),
                 replay_commit_barrier: None,
             }),
-        );
+        )
+        .await;
         let old = [1, 2, 3, 4];
         let partial = [5, 6, 7, 8];
         let replacement = [9, 10, 11, 12];
@@ -1962,19 +1956,16 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), cleanup_barrier.wait())
             .await
             .unwrap();
-        assert!(active.load(Ordering::Acquire));
+        assert!(!retired.is_cancelled());
         {
             let _guard = strict_rank.lock();
-            active.store(false, Ordering::Release);
+            retired.cancel();
             f.indexer.forget_source(&SourceId::from("w0"), 0);
         }
 
         let publisher = f._ctx.socket(zmq::PUB).unwrap();
-        let endpoint = format!(
-            "{}-replacement",
-            f.publisher.get_last_endpoint().unwrap().unwrap()
-        );
-        publisher.bind(&endpoint).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
         let (tx, mut signals) = mpsc::channel(64);
         let handle = spawn_bound(
             EventSource {
@@ -1988,11 +1979,10 @@ mod tests {
             },
             f.indexer.clone(),
             Some(tx),
-            f._ctx.clone(),
             Some(4),
             SourceLease {
                 strict_rank,
-                active: Arc::new(AtomicBool::new(true)),
+                retired: Arc::new(CancellationToken::new()),
             },
         );
         publish_until_advanced(
@@ -2025,7 +2015,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrecoverable_gap_discards_old_claims_but_preserves_other_source_and_rank() {
-        let mut f = fixture(false);
+        let mut f = fixture(false).await;
         let tokens = [1, 2, 3, 4];
         publish_until_advanced(
             &f.publisher,
@@ -2088,7 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_payload_does_not_advance_and_same_seq_can_be_retried() {
-        let mut f = fixture(false);
+        let mut f = fixture(false).await;
         let tokens = [1, 2, 3, 4];
         publish_until_advanced(
             &f.publisher,
@@ -2142,7 +2132,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_topic_prefix_does_not_publish_or_consume_the_sequence() {
-        let mut f = fixture_with_block_size(false, Some(4));
+        let mut f = fixture_with_block_size(false, Some(4)).await;
         publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
         let unrelated = [1, 2, 3, 4];
         let expected = [5, 6, 7, 8];
@@ -2169,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_unknown_field_rejects_the_whole_batch_without_advance() {
-        let mut f = fixture(false);
+        let mut f = fixture(false).await;
         publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
         let tokens = [1, 2, 3, 4];
         let mut event = serde_json::to_value(store_event(100, &tokens)).unwrap();
@@ -2352,7 +2342,7 @@ mod tests {
             (expected, tokens, live, replies)
         });
         for (expected, [old, partial, bad, fresh], live, replies) in cases {
-            let mut f = fixture_with_block_size(true, Some(expected));
+            let mut f = fixture_with_block_size(true, Some(expected)).await;
             publish_until_advanced(
                 &f.publisher,
                 &mut f.signals,
@@ -2464,7 +2454,7 @@ mod tests {
 
     // Each case owns its ZMQ fixture so failed recovery cannot contaminate the next case.
     async fn check_replay_case(case: &str) {
-        let mut f = fixture_with_block_size(true, (case == "complete").then_some(4));
+        let mut f = fixture_with_block_size(true, (case == "complete").then_some(4)).await;
         let old = [1, 2, 3, 4];
         let keep = [5, 6, 7, 8];
         let partial = [9, 10, 11, 12];
@@ -2601,7 +2591,8 @@ mod tests {
                 retry_base,
                 ..ReplayLimits::default()
             },
-        );
+        )
+        .await;
         let source = SourceId::from("w0");
         let tokens = [
             [1, 2, 3, 4],
@@ -2699,7 +2690,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_invalidation_requires_full_replay() {
-        let mut fixture = fixture_with_block_size(true, Some(4));
+        let mut fixture = fixture_with_block_size(true, Some(4)).await;
         let source = SourceId::from("w0");
         let tokens = [
             [1, 2, 3, 4],
@@ -2775,13 +2766,14 @@ mod tests {
             Some(SubscriberBinding {
                 lease: SourceLease {
                     strict_rank: strict_rank.clone(),
-                    active: Arc::new(AtomicBool::new(true)),
+                    retired: Arc::new(CancellationToken::new()),
                 },
                 replay_cleanup_barrier: None,
                 replay_commit_barrier: None,
             }),
             false,
-        );
+        )
+        .await;
         let source = SourceId::from("w0");
         let stale = [5, 6, 7, 8];
         let live = [9, 10, 11, 12];
@@ -2857,12 +2849,13 @@ mod tests {
             Some(SubscriberBinding {
                 lease: SourceLease {
                     strict_rank: strict_rank.clone(),
-                    active: Arc::new(AtomicBool::new(true)),
+                    retired: Arc::new(CancellationToken::new()),
                 },
                 replay_cleanup_barrier: None,
                 replay_commit_barrier: Some(commit_barrier.clone()),
             }),
-        );
+        )
+        .await;
         let source = SourceId::from("w0");
         let tokens = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]];
 
@@ -2961,7 +2954,8 @@ mod tests {
     #[tokio::test]
     async fn slow_replay_drains_small_hwm_and_then_catches_up_live_events() {
         let mut f =
-            fixture_with_receive_limit(true, None, None, true, Some(2), ReplayLimits::default());
+            fixture_with_receive_limit(true, None, None, true, Some(2), ReplayLimits::default())
+                .await;
         publish_until_advanced(
             &f.publisher,
             &mut f.signals,
@@ -3057,24 +3051,30 @@ mod tests {
 
     #[tokio::test]
     async fn live_buffer_exhaustion_aborts_replay_without_losing_the_received_frame() {
-        let ctx = zmq::Context::new();
-        let sender = ctx.socket(zmq::PAIR).unwrap();
-        sender.bind("inproc://replay-live-budget").unwrap();
-        let mut receiver = ctx.socket(zmq::PAIR).unwrap();
-        receiver.connect("inproc://replay-live-budget").unwrap();
+        let ctx = omq_tokio::Context::new();
+        let sender = ctx.socket(SocketType::Pair, Options::default());
+        sender.bind("inproc://replay-live-budget").await.unwrap();
+        let receiver = ctx.socket(SocketType::Pair, Options::default());
+        receiver
+            .connect("inproc://replay-live-budget")
+            .await
+            .unwrap();
         let frames = vec![
             b"kv".to_vec(),
             10i64.to_be_bytes().to_vec(),
             vec![b'x'; 128],
         ];
-        sender.send_multipart(&frames, 0).unwrap();
+        sender
+            .send(Message::multipart(frames.clone()))
+            .await
+            .unwrap();
         let mut pending = VecDeque::new();
         let (_shutdown, mut shutdown) = broadcast::channel(1);
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             buffer_live_during_replay(
                 std::future::pending(),
-                &mut receiver,
+                &receiver,
                 "kv",
                 &mut pending,
                 64,
@@ -3085,7 +3085,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result, ReplayOutcome::BufferFull);
-        assert_eq!(pending.pop_front(), Some(frames));
+        assert_eq!(
+            pending
+                .pop_front()
+                .unwrap()
+                .iter()
+                .map(|frame| frame.to_vec())
+                .collect::<Vec<_>>(),
+            frames
+        );
         assert!(pending.is_empty());
     }
 
@@ -3103,7 +3111,7 @@ mod tests {
     #[tokio::test]
     async fn unbound_shutdown_interrupts_replay_and_clears_partial_history() {
         for drop_handle in [false, true] {
-            let mut f = fixture_with_block_size(true, Some(4));
+            let mut f = fixture_with_block_size(true, Some(4)).await;
             let old = [1, 2, 3, 4];
             let partial = [5, 6, 7, 8];
             publish_until_advanced(
@@ -3162,16 +3170,19 @@ mod tests {
 
     #[tokio::test]
     async fn retired_lease_interrupts_the_live_replay_wait() {
-        let ctx = zmq::Context::new();
-        let sender = ctx.socket(zmq::PAIR).unwrap();
-        sender.bind("inproc://replay-retired-lease").unwrap();
-        let mut receiver = ctx.socket(zmq::PAIR).unwrap();
-        receiver.connect("inproc://replay-retired-lease").unwrap();
-        let active = Arc::new(AtomicBool::new(true));
+        let ctx = omq_tokio::Context::new();
+        let sender = ctx.socket(SocketType::Pair, Options::default());
+        sender.bind("inproc://replay-retired-lease").await.unwrap();
+        let receiver = ctx.socket(SocketType::Pair, Options::default());
+        receiver
+            .connect("inproc://replay-retired-lease")
+            .await
+            .unwrap();
+        let retired = Arc::new(CancellationToken::new());
         let binding = SubscriberBinding {
             lease: SourceLease {
                 strict_rank: Arc::new(Mutex::new(false)),
-                active: active.clone(),
+                retired: retired.clone(),
             },
             replay_cleanup_barrier: None,
             replay_commit_barrier: None,
@@ -3184,14 +3195,14 @@ mod tests {
         };
         let retire = async {
             started.await.unwrap();
-            active.store(false, Ordering::Release);
+            retired.cancel();
         };
         let mut pending = VecDeque::new();
         let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
             tokio::join!(
                 buffer_live_during_replay(
                     recovery,
-                    &mut receiver,
+                    &receiver,
                     "kv",
                     &mut pending,
                     MAX_PENDING_LIVE_BYTES,
@@ -3216,7 +3227,7 @@ mod tests {
             Some(SubscriberBinding {
                 lease: SourceLease {
                     strict_rank: Arc::new(Mutex::new(false)),
-                    active: Arc::new(AtomicBool::new(true)),
+                    retired: Arc::new(CancellationToken::new()),
                 },
                 replay_cleanup_barrier: Some(cleanup.clone()),
                 replay_commit_barrier: None,
@@ -3224,7 +3235,8 @@ mod tests {
             false,
             Some(4096),
             ReplayLimits::default(),
-        );
+        )
+        .await;
         let old = [1, 2, 3, 4];
         let partial = [5, 6, 7, 8];
         let fresh = [9, 10, 11, 12];
@@ -3353,7 +3365,7 @@ mod tests {
             (true, true, WorkerExact),
             (false, true, Observed),
         ] {
-            let mut f = fixture_with_recovery(strict && gap, Some(4), None, strict);
+            let mut f = fixture_with_recovery(strict && gap, Some(4), None, strict).await;
             tokio::time::timeout(Duration::from_secs(2), async {
                 while f.indexer.source_recovery_status(&source, 0).is_none() {
                     tokio::task::yield_now().await;
@@ -3561,7 +3573,7 @@ mod tests {
             ))
         };
         for use_replay in [false, true] {
-            let mut f = fixture_with_block_size(use_replay, Some(4));
+            let mut f = fixture_with_block_size(use_replay, Some(4)).await;
             let old_local = [13, 14, 15, 16];
             let old_pool = [1, 2, 3, 4];
             let new_pool = [5, 6, 7, 8];
@@ -3660,7 +3672,7 @@ mod tests {
     async fn first_nonzero_sequence_respects_recovery_mode() {
         for strict in [false, true] {
             for replay_available in [false, true] {
-                let mut f = fixture_with_recovery(replay_available, Some(4), None, strict);
+                let mut f = fixture_with_recovery(replay_available, Some(4), None, strict).await;
                 let events = [store_event(120, &[1, 2, 3, 4])];
                 tokio::join!(
                     publish_until_advanced(
@@ -3747,7 +3759,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_rejected_frames_do_not_replay_per_frame() {
-        let mut f = fixture_with_block_size(true, Some(4));
+        let mut f = fixture_with_block_size(true, Some(4)).await;
         publish_until_advanced(
             &f.publisher,
             &mut f.signals,
@@ -3802,7 +3814,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_replay_deadline_does_not_publish_partial_history() {
-        let f = fixture(true);
+        let f = fixture(true).await;
         let source = SourceId::from("w0");
         // This test drives replay directly; wait for the fixture subscriber's registration.
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -3829,7 +3841,6 @@ mod tests {
             -1,
             1,
             attempt,
-            &f._ctx,
             &f.indexer,
             &source,
             0,
@@ -3892,7 +3903,6 @@ mod tests {
             },
             indexer.clone(),
             Some(tx),
-            Arc::new(zmq::Context::new()),
         );
         assert!(tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await

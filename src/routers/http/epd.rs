@@ -1,12 +1,13 @@
 use crate::config::EpdConfig;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::future::join_all;
+use omq_tokio::{Message, Options, Socket, SocketType};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 type EpdError = (StatusCode, String);
@@ -55,27 +56,25 @@ impl Drop for EcTransferGuard {
         }
         let transfer_ids = std::mem::take(&mut self.transfer_ids);
         let control_addr = self.control_addr.clone();
-        // No blocking ZMQ operations on the HTTP runtime threads.
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = cancel_ec_transfers(&control_addr, &transfer_ids) {
+        tokio::spawn(async move {
+            if let Err(error) = cancel_ec_transfers(&control_addr, &transfer_ids).await {
                 tracing::warn!(%error, %control_addr, "Could not discover EC consumer shards for cancellation");
             }
         });
     }
 }
 
-fn ec_control_request(
-    context: &zmq::Context,
-    address: &str,
-    request: &Value,
-) -> anyhow::Result<Value> {
-    let socket = context.socket(zmq::REQ)?;
-    socket.set_linger(0)?;
-    socket.set_sndtimeo(1000)?;
-    socket.set_rcvtimeo(1000)?;
-    socket.connect(address)?;
-    socket.send(serde_json::to_vec(request)?.as_slice(), 0)?;
-    let mut response: Value = serde_json::from_slice(&socket.recv_bytes(0)?)?;
+async fn ec_control_request(address: &str, request: &Value) -> anyhow::Result<Value> {
+    let socket = Socket::new(SocketType::Req, Options::default());
+    let timeout = Duration::from_secs(1);
+    socket.connect(address).await?;
+    let request = Message::single(serde_json::to_vec(request)?);
+    tokio::time::timeout(timeout, socket.send(request)).await??;
+    let reply = tokio::time::timeout(timeout, socket.recv()).await??;
+    let frame = reply
+        .get(0)
+        .ok_or_else(|| anyhow::anyhow!("Empty EC control reply"))?;
+    let mut response: Value = serde_json::from_slice(frame)?;
     anyhow::ensure!(
         response["ok"] == true,
         "EC control request failed: {}",
@@ -84,9 +83,8 @@ fn ec_control_request(
     Ok(response["result"].take())
 }
 
-fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::Result<()> {
-    let context = zmq::Context::new();
-    let peers = ec_control_request(&context, control_addr, &json!({"op": "peers"}))?;
+async fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::Result<()> {
+    let peers = ec_control_request(control_addr, &json!({"op": "peers"})).await?;
     let ports: Vec<u16> = serde_json::from_value(peers["ports"].clone())?;
     anyhow::ensure!(
         !ports.is_empty() && !ports.contains(&0),
@@ -99,7 +97,7 @@ fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::R
         let address = format!("{prefix}:{port}");
         for transfer_id in transfer_ids {
             let request = json!({"op": "cancel", "transfer_id": transfer_id, "abandon": true});
-            if let Err(error) = ec_control_request(&context, &address, &request) {
+            if let Err(error) = ec_control_request(&address, &request).await {
                 tracing::warn!(%error, %address, %transfer_id, "Could not cancel abandoned EC transfer");
             }
         }
@@ -990,8 +988,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn control_request_rejects_remote_errors() {
+    #[tokio::test]
+    async fn control_request_rejects_remote_errors() {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::REP).unwrap();
         socket.set_rcvtimeo(5000).unwrap();
@@ -1008,7 +1006,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let result = ec_control_request(&context, &address, &json!({"op": "peers"}));
+        let result = ec_control_request(&address, &json!({"op": "peers"})).await;
         server.join().unwrap();
         assert!(result.unwrap_err().to_string().contains("injected failure"));
     }

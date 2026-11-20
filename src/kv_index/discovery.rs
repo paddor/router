@@ -2,7 +2,6 @@
 //! subscriber per (worker, rank). One indexer per cache-identity core.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +9,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::StaticKvEventSources;
@@ -80,7 +80,7 @@ pub(crate) struct WorkerDiscovery {
 
 /// Per-worker subscriber state retained for removal-time cleanup.
 struct WorkerSubs {
-    active: Arc<AtomicBool>,
+    retired: Arc<CancellationToken>,
     key: CacheKey,
     source_id: SourceId,
     worker_origin: Option<String>,
@@ -113,8 +113,6 @@ pub struct KvIndexSupervisor {
     /// Static KV event sources per prefill URL; these workers skip HTTP
     /// discovery entirely.
     static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
-    /// Shared across every subscriber — one I/O thread pool, not one per task.
-    ctx: Arc<zmq::Context>,
     /// One indexer per cache-identity core.
     indexers: DashMap<CacheKey, Arc<KvBlockIndexer>>,
     /// Live-worker ref-count per identity; drop the indexer on last departure.
@@ -154,7 +152,6 @@ impl KvIndexSupervisor {
             http_pd: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
-            ctx: Arc::new(zmq::Context::new()),
             indexers: DashMap::new(),
             identity_refs: Mutex::new(HashMap::new()),
             signal_tx,
@@ -226,7 +223,7 @@ impl KvIndexSupervisor {
             .workers
             .lock()
             .get(worker_url)
-            .map(|worker| worker.active.clone());
+            .map(|worker| worker.retired.clone());
         let discovery = self.discover(worker_url).await;
         self.install_observed_worker(worker_url, discovery, observed)
     }
@@ -276,7 +273,7 @@ impl KvIndexSupervisor {
             .workers
             .lock()
             .get(worker_url)
-            .map(|worker| worker.active.clone());
+            .map(|worker| worker.retired.clone());
         self.install_observed_worker(worker_url, discovery, observed)
     }
 
@@ -284,7 +281,7 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         discovery: WorkerDiscovery,
-        observed: Option<Arc<AtomicBool>>,
+        observed: Option<Arc<CancellationToken>>,
     ) -> Result<WorkerKvInfo, String> {
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
@@ -413,7 +410,7 @@ impl KvIndexSupervisor {
         // concurrent discoveries must not both accept an ambiguous binding.
         let mut workers = self.workers.lock();
         let unchanged = match (observed.as_ref(), workers.get(worker_url)) {
-            (Some(observed), Some(current)) => Arc::ptr_eq(observed, &current.active),
+            (Some(observed), Some(current)) => Arc::ptr_eq(observed, &current.retired),
             (None, None) => true,
             _ => false,
         };
@@ -458,7 +455,7 @@ impl KvIndexSupervisor {
         }
         // No admission can fail below this point. Share rank guards by exact
         // publisher/topic and promote them monotonically before publishing B.
-        let active = Arc::new(AtomicBool::new(true));
+        let retired = Arc::new(CancellationToken::new());
         let mut live_sources: Vec<LiveSource> = Vec::with_capacity(event_sources.len());
         for source in &event_sources {
             let strict_rank = workers
@@ -505,7 +502,7 @@ impl KvIndexSupervisor {
                 rank: source.dp_rank,
                 lease: super::binding::SourceLease {
                     strict_rank,
-                    active: active.clone(),
+                    retired: retired.clone(),
                 },
             });
         }
@@ -524,7 +521,6 @@ impl KvIndexSupervisor {
                 ev,
                 indexer.clone(),
                 Some(self.signal_tx.clone()),
-                self.ctx.clone(),
                 full_attention.then_some(key.block_size),
                 live.lease.clone(),
             );
@@ -539,7 +535,7 @@ impl KvIndexSupervisor {
         workers.insert(
             worker_url.to_string(),
             WorkerSubs {
-                active,
+                retired,
                 key: key.clone(),
                 source_id,
                 worker_origin,
@@ -570,7 +566,7 @@ impl KvIndexSupervisor {
     }
 
     fn retire_worker(&self, subs: WorkerSubs) {
-        subs.active.store(false, Ordering::Release);
+        subs.retired.cancel();
         for handle in &subs.handles {
             handle.shutdown();
         }
@@ -1332,6 +1328,7 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
 mod tests {
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn configured_event_sources_skip_unavailable_control_discovery() {
@@ -1959,17 +1956,17 @@ mod tests {
         ));
         let provider = supervisor.match_provider_for_worker(&worker_a).unwrap();
         assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-        let original = supervisor.workers.lock()[&worker_a].active.clone();
+        let original = supervisor.workers.lock()[&worker_a].retired.clone();
         *sources_a.lock() = source(&endpoint_b);
         assert!(supervisor
             .on_worker_added(&worker_a)
             .await
             .unwrap_err()
             .contains("live KV streams"));
-        assert!(original.load(Ordering::Acquire));
+        assert!(!original.is_cancelled());
         assert!(Arc::ptr_eq(
             &original,
-            &supervisor.workers.lock()[&worker_a].active
+            &supervisor.workers.lock()[&worker_a].retired
         ));
         assert!(supervisor.match_provider_for_worker(&worker_a).is_some());
         assert_eq!(provider.find_tiered_matches(&query).len(), 1);
@@ -1992,9 +1989,9 @@ mod tests {
                 supervisor.on_worker_added(&worker_a).await.is_err(),
                 "{case} must reject the complete re-add"
             );
-            assert!(original.load(Ordering::Acquire), "{case}");
+            assert!(!original.is_cancelled(), "{case}");
             assert!(
-                Arc::ptr_eq(&original, &supervisor.workers.lock()[&worker_a].active),
+                Arc::ptr_eq(&original, &supervisor.workers.lock()[&worker_a].retired),
                 "{case}"
             );
             assert!(
@@ -2010,10 +2007,10 @@ mod tests {
         }
         *sources_a.lock() = source(&endpoint_a);
         supervisor.on_worker_added(&worker_a).await.unwrap();
-        assert!(!original.load(Ordering::Acquire));
+        assert!(original.is_cancelled());
         assert!(!Arc::ptr_eq(
             &original,
-            &supervisor.workers.lock()[&worker_a].active
+            &supervisor.workers.lock()[&worker_a].retired
         ));
         assert!(provider.find_tiered_matches(&query).is_empty());
         boundary_subscription(&publisher_a, "kv/boundary", true).await;
@@ -2503,7 +2500,7 @@ mod tests {
             let (indexer, active) = {
                 let workers = supervisor.workers.lock();
                 let entry = &workers[&worker];
-                (entry.indexer.clone(), entry.active.clone())
+                (entry.indexer.clone(), entry.retired.clone())
             };
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
             let (neighbor_tx, mut neighbor_signals) = mpsc::channel(8);
@@ -2519,7 +2516,6 @@ mod tests {
                 },
                 indexer,
                 Some(neighbor_tx),
-                context.clone(),
             );
             boundary_subscription(&publisher, "kv/independent", false).await;
             let payload =
@@ -2572,7 +2568,7 @@ mod tests {
                 assert!(supervisor.identity_refs.lock().is_empty());
             }
             drop(supervisor);
-            assert!(!active.load(Ordering::Acquire));
+            assert!(active.is_cancelled());
             for (seq, body) in [
                 (1i64, payload(4, 4, 0)),
                 (2, payload(3, 3, 0)),
@@ -2738,7 +2734,6 @@ mod tests {
                 },
                 indexer.clone(),
                 Some(tx),
-                Arc::new(zmq::Context::new()),
             ));
             boundary_subscription(&publisher, topic, false).await;
             let payload = store_payload(70, &old_tokens, expected, "GPU", Some(neighbor_rank));
