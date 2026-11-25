@@ -132,6 +132,10 @@ portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+# KV event transport comparison (benches/kv_event_transport.rs, #607).
+omq-tokio = "=0.39.2"
+zeromq = { version = "0.7", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+zmq-sys = "0.12"
 # Per-process CPU and RSS accounting for the router overhead harness.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
@@ -160,6 +164,11 @@ path = "benches/routing_input.rs"
 name = "otel_disabled_path"
 harness = false
 path = "benches/otel_disabled_path.rs"
+
+[[bench]]
+name = "kv_event_transport"
+harness = false
+path = "benches/kv_event_transport.rs"
 
 # Cargo auto-discovers only tests/*.rs. Integration tests live under tests/rust/.
 # Adding a file there requires a matching [[test]] entry; pre-commit hook
